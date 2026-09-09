@@ -1,605 +1,295 @@
 import { useEffect, useState } from 'react';
-import {
-  AlertCircle,
-  ArrowLeft,
-  Check,
-  CheckCircle2,
-  Copy,
-  Edit2,
-  Filter,
-  Globe,
-  Loader2,
-  Plus,
-  RotateCcw,
-  Settings,
-  ShieldCheck,
-  Sparkles,
-  Trash2,
-  X
-} from 'lucide-react';
-import {
-  clearAllSessions,
-  deleteSession,
-  getAllSessions,
-  getFilterConfig,
-  resetFilterConfig,
-  saveFilterConfig
-} from '@/utils/storage';
-import { FilterConfig, FilterMode, ProviderRule, Session } from '@/types';
-import { DEFAULT_FILTER_CONFIG } from '@/matcher/endpoint-matcher';
+import { AlertTriangle, ArrowDownLeft, ArrowUpRight, Copy, Database, RefreshCw, Trash2 } from 'lucide-react';
+import type { Capture, MessageBody, MessageHeaders } from '@/capture/capture';
+import { base64ToBytes } from '@/capture/bytes';
+import { loadDebugUiConfig } from '@/config/config-projection-store';
+import { createCaptureStore, type CapacityStatus, type CaptureCleaner, type CaptureReader, type CaptureSummary, type InteractionSummary } from '@/storage/capture-store';
+import { clearDiagnostics, loadDiagnostics, type DiagnosticRecord } from '@/storage/diagnostic-store';
+import { decodeBodyText } from './body-text';
 
-export default function SidePanel() {
-  const [activeTab, setActiveTab] = useState<'inspector' | 'settings'>('inspector');
-  const [sessions, setSessions] = useState<Session[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [copied, setCopied] = useState<string | null>(null);
+const store: CaptureReader & CaptureCleaner = createCaptureStore({
+  config: () => ({
+    revision: 'sidepanel', warningBytes: 384 * 1024 * 1024,
+    hardLimitBytes: 512 * 1024 * 1024, draftTtlMs: 86_400_000,
+  }),
+});
 
-  // Filter Configuration State
-  const [filterConfig, setFilterConfig] = useState<FilterConfig>(DEFAULT_FILTER_CONFIG);
-  const [editingRule, setEditingRule] = useState<ProviderRule | null>(null);
-  const [isFormOpen, setIsFormOpen] = useState(false);
-  const [formProvider, setFormProvider] = useState('');
-  const [formUrlPattern, setFormUrlPattern] = useState('');
-  const [formDescription, setFormDescription] = useState('');
+type DetailTab = 'overview' | 'headers' | 'body';
+type BodyView = 'hex' | 'base64' | 'text';
+
+export default function App() {
+  const [interactions, setInteractions] = useState<InteractionSummary[]>([]);
+  const [selectedInteraction, setSelectedInteraction] = useState<string | null>(null);
+  const [summaries, setSummaries] = useState<CaptureSummary[]>([]);
+  const [selectedCapture, setSelectedCapture] = useState<Capture | null>(null);
+  const [capacity, setCapacity] = useState<CapacityStatus | null>(null);
+  const [detailTab, setDetailTab] = useState<DetailTab>('overview');
+  const [defaultBodyView, setDefaultBodyView] = useState<BodyView>('text');
+  const [bodyView, setBodyView] = useState<BodyView>('text');
+  const [error, setError] = useState<string | null>(null);
+  const [diagnostics, setDiagnostics] = useState<DiagnosticRecord[]>([]);
+  const [clearing, setClearing] = useState(false);
+  const selectedInteractionCaptureCount = interactions.find((interaction) => interaction.id === selectedInteraction)?.captureCount ?? 0;
+
+  const refresh = async (pageSize = 100) => {
+    try {
+      const [page, status, recentDiagnostics] = await Promise.all([
+        store.listInteractions({ limit: pageSize }), store.getCapacityStatus(), loadDiagnostics(3),
+      ]);
+      setInteractions(page.items);
+      setCapacity(status);
+      setDiagnostics(recentDiagnostics);
+      setSelectedInteraction((current) => current ?? page.items[0]?.id ?? null);
+      setError(null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
 
   useEffect(() => {
-    getAllSessions().then((stored) => {
-      setSessions(stored);
-      if (stored[0]) setSelectedId(stored[0].id);
-    });
-
-    getFilterConfig().then((config) => {
-      setFilterConfig(config);
-    });
-
-    const listener = (message: any) => {
-      if (message?.type === 'AI_HOOK_CONFIG_SYNC' && message.data) {
-        setFilterConfig(message.data);
+    let timer: ReturnType<typeof setInterval> | null = null;
+    let stopped = false;
+    void loadDebugUiConfig().then((config) => {
+      if (stopped) return;
+      const pageSize = config?.pageSize ?? 100;
+      if (config) {
+        setDefaultBodyView(config.defaultBodyView);
+        setBodyView(config.defaultBodyView);
       }
-
-      if (message?.type !== 'AI_HOOK_BROADCAST') return;
-      const payload = message.data;
-      setSessions((current) => {
-        const index = current.findIndex((session) => session.id === payload.id);
-        if (index < 0 && payload.type === 'AI_HOOK_START') {
-          const next = [
-            {
-              id: payload.id,
-              platform: payload.platform,
-              model: payload.model,
-              url: payload.url,
-              timestamp: payload.timestamp,
-              status: 'streaming' as const,
-              prompts: payload.prompts || [],
-              response: '',
-              rawRequest: payload.rawRequest
-            },
-            ...current
-          ];
-          setSelectedId((selected) => selected || payload.id);
-          return next;
-        }
-        if (index < 0) return current;
-        const next = [...current];
-        next[index] = {
-          ...next[index],
-          status:
-            payload.type === 'AI_HOOK_END'
-              ? payload.status || 'completed'
-              : payload.type === 'AI_HOOK_ERROR'
-                ? 'error'
-                : 'streaming',
-          response: payload.response ?? next[index].response,
-          model: payload.model || next[index].model,
-          error: payload.error || next[index].error
-        };
-        return next;
-      });
+      void refresh(pageSize);
+      timer = setInterval(() => void refresh(pageSize), config?.refreshIntervalMs ?? 2_000);
+    });
+    return () => {
+      stopped = true;
+      if (timer) clearInterval(timer);
     };
-
-    chrome.runtime.onMessage.addListener(listener);
-    return () => chrome.runtime.onMessage.removeListener(listener);
   }, []);
-
-  const updateAndBroadcastConfig = async (nextConfig: FilterConfig) => {
-    setFilterConfig(nextConfig);
-    await saveFilterConfig(nextConfig);
-    chrome.runtime.sendMessage({ type: 'UPDATE_FILTER_CONFIG', data: nextConfig }).catch(() => {});
-  };
-
-  const handleToggleMode = async (mode: FilterMode) => {
-    const nextConfig: FilterConfig = { ...filterConfig, mode };
-    await updateAndBroadcastConfig(nextConfig);
-  };
-
-  const handleToggleRule = async (ruleId: string) => {
-    const nextRules = filterConfig.rules.map((rule) =>
-      rule.id === ruleId ? { ...rule, enabled: !rule.enabled } : rule
-    );
-    await updateAndBroadcastConfig({ ...filterConfig, rules: nextRules });
-  };
-
-  const handleDeleteRule = async (ruleId: string) => {
-    if (!confirm('确定删除该 Provider 拦截规则？')) return;
-    const nextRules = filterConfig.rules.filter((rule) => rule.id !== ruleId);
-    await updateAndBroadcastConfig({ ...filterConfig, rules: nextRules });
-  };
-
-  const handleResetConfig = async () => {
-    if (!confirm('确定恢复所有 Provider 默认规则及白名单配置？')) return;
-    const reset = await resetFilterConfig();
-    setFilterConfig(reset);
-    chrome.runtime.sendMessage({ type: 'RESET_FILTER_CONFIG' }).catch(() => {});
-  };
-
-  const openAddRuleModal = () => {
-    setEditingRule(null);
-    setFormProvider('');
-    setFormUrlPattern('');
-    setFormDescription('');
-    setIsFormOpen(true);
-  };
-
-  const openEditRuleModal = (rule: ProviderRule) => {
-    setEditingRule(rule);
-    setFormProvider(rule.provider);
-    setFormUrlPattern(rule.urlPattern);
-    setFormDescription(rule.description || '');
-    setIsFormOpen(true);
-  };
-
-  const handleSaveRule = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const provider = formProvider.trim();
-    const urlPattern = formUrlPattern.trim();
-    if (!provider || !urlPattern) return;
-
-    let nextRules: ProviderRule[];
-    if (editingRule) {
-      nextRules = filterConfig.rules.map((r) =>
-        r.id === editingRule.id
-          ? { ...r, provider, urlPattern, description: formDescription.trim() }
-          : r
-      );
-    } else {
-      const newRule: ProviderRule = {
-        id: `rule_custom_${Date.now()}`,
-        provider,
-        urlPattern,
-        enabled: true,
-        description: formDescription.trim() || undefined
-      };
-      nextRules = [newRule, ...filterConfig.rules];
+  useEffect(() => {
+    let stopped = false;
+    if (!selectedInteraction) {
+      setSummaries([]);
+      setSelectedCapture(null);
+      return;
     }
+    void (async () => {
+      const items = await store.listCaptures({ interactionId: selectedInteraction });
+      if (stopped) return;
+      setSummaries(items);
+      if (selectedCapture && items.some((item) => item.id === selectedCapture.id)) return;
+      const first = items[0] ? await store.getById(items[0].id) : null;
+      if (stopped) return;
+      setSelectedCapture(first);
+      setBodyView(defaultBodyView);
+      setDetailTab('overview');
+    })().catch((reason) => {
+      if (!stopped) setError(String(reason));
+    });
+    return () => { stopped = true; };
+  }, [selectedInteraction, selectedInteractionCaptureCount, selectedCapture?.id, defaultBodyView]);
 
-    await updateAndBroadcastConfig({ ...filterConfig, rules: nextRules });
-    setIsFormOpen(false);
+  const selectCapture = async (id: string) => {
+    const capture = await store.getById(id);
+    setSelectedCapture(capture);
+    setBodyView(defaultBodyView);
+    setDetailTab('overview');
   };
 
-  const copy = (text: string, key: string) => {
-    navigator.clipboard.writeText(text);
-    setCopied(key);
-    setTimeout(() => setCopied(null), 1200);
+  const clearStoredData = async () => {
+    if (!window.confirm('Clear all captured data? This cannot be undone.')) return;
+    setClearing(true);
+    try {
+      await Promise.all([store.clear(), clearDiagnostics()]);
+      setInteractions([]);
+      setSelectedInteraction(null);
+      setSummaries([]);
+      setSelectedCapture(null);
+      setDiagnostics([]);
+      setCapacity(await store.getCapacityStatus());
+      setError(null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setClearing(false);
+    }
   };
-
-  const selected = sessions.find((session) => session.id === selectedId);
 
   return (
-    <main className="flex h-screen flex-col bg-slate-950 text-slate-100 text-xs">
-      {/* Header */}
-      <header className="flex items-center justify-between border-b border-slate-800 px-3 py-2.5">
-        <div className="flex items-center gap-2 font-semibold">
-          <Sparkles className="h-4 w-4 text-indigo-400" />
-          <span>AI Hook Inspector</span>
-          {activeTab === 'inspector' && (
-            <span className="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] text-slate-400">
-              {sessions.length}
-            </span>
-          )}
+    <main className="app-shell">
+      <header className="topbar">
+        <div>
+          <h1>Network Capture</h1>
+          <p>HTTP · SSE · WebSocket</p>
         </div>
-        <div className="flex items-center gap-1">
-          {activeTab === 'inspector' ? (
-            <>
-              <button
-                title="Endpoint & Provider 过滤配置"
-                onClick={() => setActiveTab('settings')}
-                className="flex items-center gap-1 rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-300 hover:bg-slate-800 hover:text-indigo-300 transition-colors"
-              >
-                <Filter className="h-3.5 w-3.5 text-indigo-400" />
-                <span>过滤规则</span>
-              </button>
-              <button
-                title="Clear sessions"
-                onClick={async () => {
-                  if (confirm('Clear all sessions?')) {
-                    await clearAllSessions();
-                    setSessions([]);
-                    setSelectedId(null);
-                  }
-                }}
-                className="rounded p-1.5 text-slate-400 hover:bg-red-950/40 hover:text-red-400"
-              >
-                <Trash2 className="h-4 w-4" />
-              </button>
-            </>
-          ) : (
-            <button
-              onClick={() => setActiveTab('inspector')}
-              className="flex items-center gap-1 rounded bg-indigo-600 px-2 py-1 text-white hover:bg-indigo-500 font-medium transition-colors"
-            >
-              <ArrowLeft className="h-3.5 w-3.5" />
-              <span>返回捕获列表</span>
-            </button>
-          )}
+        <div className="topbar-actions">
+          {capacity && <CapacityBadge status={capacity} />}
+          <button className="icon-button danger-button" title="Clear all captured data" aria-label="Clear all captured data" disabled={clearing} onClick={() => void clearStoredData()}>
+            <Trash2 size={16} />
+          </button>
+          <button className="icon-button" title="Refresh captures" onClick={() => void refresh()}>
+            <RefreshCw size={16} />
+          </button>
         </div>
       </header>
 
-      {/* Main Tab Views */}
-      {activeTab === 'inspector' ? (
-        <div className="flex min-h-0 flex-1">
-          {/* Session List */}
-          <aside className="w-2/5 min-w-[140px] overflow-y-auto border-r border-slate-800">
-            {sessions.length === 0 ? (
-              <div className="p-4 text-center text-slate-500 space-y-2">
-                <Globe className="mx-auto h-6 w-6 opacity-40 text-slate-400" />
-                <p>暂无捕获数据</p>
-                <p className="text-[10px] text-slate-600">
-                  当前模式:{' '}
-                  {filterConfig.mode === 'whitelist' ? '仅监控白名单 API' : '监控全部请求'}
-                </p>
-              </div>
-            ) : (
-              sessions.map((session) => (
-                <button
-                  key={session.id}
-                  onClick={() => setSelectedId(session.id)}
-                  className={`block w-full border-b border-slate-800 p-2 text-left hover:bg-slate-900 ${
-                    selectedId === session.id ? 'border-l-2 border-indigo-500 bg-indigo-950/30' : ''
-                  }`}
-                >
-                  <div className="mb-1 flex justify-between uppercase text-[10px] text-slate-400">
-                    <span className="font-semibold text-indigo-300">{session.platform}</span>
-                    {session.status === 'streaming' ? (
-                      <Loader2 className="h-3 w-3 animate-spin text-indigo-400" />
-                    ) : session.status === 'error' || session.status === 'unparsed' ? (
-                      <AlertCircle className="h-3 w-3 text-amber-400" />
-                    ) : (
-                      <CheckCircle2 className="h-3 w-3 text-emerald-400" />
-                    )}
-                  </div>
-                  <div className="line-clamp-2 text-slate-200">
-                    {session.prompts.at(-1)?.content || 'No prompt'}
-                  </div>
-                  <div className="mt-1 text-[10px] text-slate-500">
-                    {new Date(session.timestamp).toLocaleTimeString()}
-                  </div>
-                </button>
-              ))
-            )}
-          </aside>
-
-          {/* Session Detail */}
-          <section className="min-w-0 flex-1 overflow-y-auto p-3">
-            {!selected ? (
-              <div className="flex h-full items-center justify-center text-slate-500">
-                Select a session
-              </div>
-            ) : (
-              <div className="flex flex-col gap-4">
-                <div className="border-b border-slate-800 pb-3">
-                  <div className="flex items-center gap-2">
-                    <span className="rounded bg-indigo-950 border border-indigo-800/60 px-1.5 py-0.5 text-[10px] font-mono text-indigo-300">
-                      {selected.platform}
-                    </span>
-                    <span className="font-semibold text-slate-100">
-                      {selected.model || 'Unknown model'}
-                    </span>
-                  </div>
-                  <div className="mt-1 break-all text-[10px] text-slate-500">
-                    {selected.transport?.toUpperCase() || 'REQUEST'} · {selected.method || 'REQUEST'}{' '}
-                    {selected.url}
-                  </div>
-                  <div className="mt-0.5 text-[10px] text-slate-500">
-                    format: {selected.format || 'unknown'} · status: {selected.statusCode || 'pending'}
-                  </div>
-                </div>
-
-                {/* Request */}
-                <div>
-                  <div className="mb-1 flex justify-between font-semibold text-indigo-300">
-                    <span>Request / Prompt</span>
-                    <button
-                      title="Copy request"
-                      onClick={() =>
-                        copy(
-                          JSON.stringify(selected.requestBody ?? selected.prompts, null, 2),
-                          'prompt'
-                        )
-                      }
-                      className="hover:text-white"
-                    >
-                      <Copy className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                  <pre className="whitespace-pre-wrap break-words rounded bg-slate-900 p-2 text-slate-300 border border-slate-800 max-h-56 overflow-y-auto">
-                    {selected.requestBody
-                      ? JSON.stringify(selected.requestBody, null, 2)
-                      : selected.prompts.map((p) => `${p.role}: ${p.content}`).join('\n\n') ||
-                        'Empty request'}
-                  </pre>
-                  {copied === 'prompt' && (
-                    <span className="text-[10px] text-emerald-400">已复制请求内容</span>
-                  )}
-                </div>
-
-                {/* Response */}
-                <div>
-                  <div className="mb-1 flex justify-between font-semibold text-emerald-400">
-                    <span>Response</span>
-                    <button
-                      title="Copy response"
-                      onClick={() => copy(selected.response, 'response')}
-                      className="hover:text-white"
-                    >
-                      <Copy className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                  <pre className="min-h-24 whitespace-pre-wrap break-words rounded bg-slate-900 p-2 text-slate-200 border border-slate-800 max-h-72 overflow-y-auto">
-                    {selected.response ||
-                      (selected.status === 'streaming'
-                        ? 'Waiting for response...'
-                        : selected.status === 'unparsed'
-                          ? 'Response could not be parsed.'
-                          : selected.error || 'Empty response')}
-                  </pre>
-                  {copied === 'response' && (
-                    <span className="text-[10px] text-emerald-400">已复制响应内容</span>
-                  )}
-                </div>
-
-                <button
-                  onClick={async () => {
-                    await deleteSession(selected.id);
-                    setSessions((current) => current.filter((s) => s.id !== selected.id));
-                    setSelectedId(null);
-                  }}
-                  className="self-start rounded px-2.5 py-1 text-red-400 hover:bg-red-950/40 border border-red-900/40 transition-colors"
-                >
-                  Delete session
-                </button>
-              </div>
-            )}
-          </section>
-        </div>
-      ) : (
-        /* Settings / Endpoint Mapping Tab */
-        <div className="flex-1 overflow-y-auto p-4 space-y-6">
-          {/* Filter Mode Control */}
-          <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 space-y-3">
-            <div className="flex items-center gap-2">
-              <ShieldCheck className="h-4 w-4 text-indigo-400" />
-              <h2 className="font-semibold text-sm text-slate-100">监控过滤模式</h2>
+      {error && <div className="error-banner"><AlertTriangle size={15} />{error}</div>}
+      {diagnostics.length > 0 && (
+        <div className="diagnostics" aria-label="Recent diagnostics">
+          {diagnostics.map((diagnostic) => (
+            <div key={diagnostic.id} className={`diagnostic diagnostic-${diagnostic.level}`}>
+              <AlertTriangle size={13} />
+              <strong>{diagnostic.area}</strong>
+              <span>{diagnostic.message}</span>
+              <time>{formatTime(diagnostic.occurredAt)}</time>
             </div>
-            <p className="text-[11px] text-slate-400">
-              设置扩展如何判定是否拦截宿主页面的网络请求。
-            </p>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
-              <button
-                onClick={() => handleToggleMode('whitelist')}
-                className={`flex flex-col items-start p-2.5 rounded-lg border text-left transition-all ${
-                  filterConfig.mode === 'whitelist'
-                    ? 'border-indigo-500 bg-indigo-950/40 text-slate-100'
-                    : 'border-slate-800 bg-slate-900/40 text-slate-400 hover:border-slate-700'
-                }`}
-              >
-                <div className="flex items-center justify-between w-full font-medium text-xs">
-                  <span>白名单模式 (推荐)</span>
-                  {filterConfig.mode === 'whitelist' && (
-                    <Check className="h-3.5 w-3.5 text-indigo-400" />
-                  )}
-                </div>
-                <span className="text-[10px] text-slate-400 mt-1">
-                  仅拦截并解析下方已启用的 Provider 及 API Endpoint
-                </span>
-              </button>
-
-              <button
-                onClick={() => handleToggleMode('all')}
-                className={`flex flex-col items-start p-2.5 rounded-lg border text-left transition-all ${
-                  filterConfig.mode === 'all'
-                    ? 'border-indigo-500 bg-indigo-950/40 text-slate-100'
-                    : 'border-slate-800 bg-slate-900/40 text-slate-400 hover:border-slate-700'
-                }`}
-              >
-                <div className="flex items-center justify-between w-full font-medium text-xs">
-                  <span>全量监控模式</span>
-                  {filterConfig.mode === 'all' && <Check className="h-3.5 w-3.5 text-indigo-400" />}
-                </div>
-                <span className="text-[10px] text-slate-400 mt-1">
-                  拦截所有网络流；匹配规则的附加 Provider 标签
-                </span>
-              </button>
-            </div>
-          </div>
-
-          {/* Provider Mapping Rules */}
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Settings className="h-4 w-4 text-indigo-400" />
-                <h2 className="font-semibold text-sm text-slate-100">
-                  Provider 与 API Endpoints 映射
-                </h2>
-                <span className="rounded-full bg-slate-800 px-2 py-0.5 font-mono text-[10px] text-slate-400">
-                  {filterConfig.rules.length}
-                </span>
-              </div>
-              <div className="flex gap-2">
-                <button
-                  title="恢复系统预设规则"
-                  onClick={handleResetConfig}
-                  className="flex items-center gap-1 rounded border border-slate-800 bg-slate-900 px-2 py-1 text-slate-400 hover:text-slate-200 hover:bg-slate-800 text-[11px]"
-                >
-                  <RotateCcw className="h-3 w-3" />
-                  <span>重置默认</span>
-                </button>
-                <button
-                  onClick={openAddRuleModal}
-                  className="flex items-center gap-1 rounded bg-indigo-600 px-2.5 py-1 text-white hover:bg-indigo-500 font-medium text-[11px]"
-                >
-                  <Plus className="h-3.5 w-3.5" />
-                  <span>添加规则</span>
-                </button>
-              </div>
-            </div>
-
-            {/* Rule List */}
-            <div className="space-y-2">
-              {filterConfig.rules.map((rule) => (
-                <div
-                  key={rule.id}
-                  className={`flex flex-col sm:flex-row sm:items-center justify-between gap-2 rounded-lg border p-3 transition-colors ${
-                    rule.enabled
-                      ? 'border-slate-800 bg-slate-900/70 text-slate-200'
-                      : 'border-slate-800/40 bg-slate-950 text-slate-500 opacity-60'
-                  }`}
-                >
-                  <div className="flex items-start gap-3 min-w-0 flex-1">
-                    {/* Toggle Switch */}
-                    <button
-                      type="button"
-                      onClick={() => handleToggleRule(rule.id)}
-                      className={`relative mt-0.5 inline-flex h-4 w-8 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                        rule.enabled ? 'bg-indigo-600' : 'bg-slate-700'
-                      }`}
-                    >
-                      <span
-                        className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
-                          rule.enabled ? 'translate-x-4' : 'translate-x-0'
-                        }`}
-                      />
-                    </button>
-
-                    <div className="min-w-0 flex-1 space-y-1">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <span className="font-semibold text-slate-100 text-xs">
-                          {rule.provider}
-                        </span>
-                        {rule.description && (
-                          <span className="text-[10px] text-slate-400">· {rule.description}</span>
-                        )}
-                      </div>
-                      <div className="font-mono text-[11px] text-indigo-300 break-all bg-slate-950/80 px-2 py-0.5 rounded border border-slate-800/80 inline-block max-w-full">
-                        {rule.urlPattern}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-1 self-end sm:self-center">
-                    <button
-                      title="编辑规则"
-                      onClick={() => openEditRuleModal(rule)}
-                      className="rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-slate-200"
-                    >
-                      <Edit2 className="h-3.5 w-3.5" />
-                    </button>
-                    <button
-                      title="删除规则"
-                      onClick={() => handleDeleteRule(rule.id)}
-                      className="rounded p-1 text-slate-400 hover:bg-red-950/40 hover:text-red-400"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Add/Edit Modal */}
-          {isFormOpen && (
-            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-              <div className="w-full max-w-md rounded-xl border border-slate-800 bg-slate-900 p-5 shadow-2xl space-y-4">
-                <div className="flex items-center justify-between border-b border-slate-800 pb-2.5">
-                  <h3 className="font-semibold text-slate-100">
-                    {editingRule ? '编辑 Provider 映射规则' : '添加 Provider 映射规则'}
-                  </h3>
-                  <button
-                    onClick={() => setIsFormOpen(false)}
-                    className="text-slate-400 hover:text-white"
-                  >
-                    <X className="h-4 w-4" />
-                  </button>
-                </div>
-
-                <form onSubmit={handleSaveRule} className="space-y-3">
-                  <div>
-                    <label className="block text-[11px] font-medium text-slate-300 mb-1">
-                      Provider 名称 (如 OpenAI, Claude, CustomBot)
-                    </label>
-                    <input
-                      type="text"
-                      required
-                      placeholder="e.g. OpenAI"
-                      value={formProvider}
-                      onChange={(e) => setFormProvider(e.target.value)}
-                      className="w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-slate-100 focus:border-indigo-500 focus:outline-none"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-[11px] font-medium text-slate-300 mb-1">
-                      URL 匹配模式 (支持通配符 * 或 /regex/i)
-                    </label>
-                    <input
-                      type="text"
-                      required
-                      placeholder="e.g. */v1/chat/completions* or *myproxy.com/*"
-                      value={formUrlPattern}
-                      onChange={(e) => setFormUrlPattern(e.target.value)}
-                      className="w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 font-mono text-xs text-slate-100 focus:border-indigo-500 focus:outline-none"
-                    />
-                    <p className="mt-1 text-[10px] text-slate-400">
-                      例如：<code>*openai.com/v1/chat*</code>、<code>*/v1/chat/completions*</code> 或{' '}
-                      <code>/api\/v1\/chat/i</code>
-                    </p>
-                  </div>
-
-                  <div>
-                    <label className="block text-[11px] font-medium text-slate-300 mb-1">
-                      备注说明 (可选)
-                    </label>
-                    <input
-                      type="text"
-                      placeholder="e.g. 公司自建大模型网关"
-                      value={formDescription}
-                      onChange={(e) => setFormDescription(e.target.value)}
-                      className="w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-slate-100 focus:border-indigo-500 focus:outline-none"
-                    />
-                  </div>
-
-                  <div className="flex justify-end gap-2 pt-2 border-t border-slate-800">
-                    <button
-                      type="button"
-                      onClick={() => setIsFormOpen(false)}
-                      className="rounded border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-700"
-                    >
-                      取消
-                    </button>
-                    <button
-                      type="submit"
-                      className="rounded bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-500"
-                    >
-                      保存规则
-                    </button>
-                  </div>
-                </form>
-              </div>
-            </div>
-          )}
+          ))}
         </div>
       )}
+
+      <div className="workspace">
+        <aside className="interaction-pane">
+          {interactions.length === 0 ? (
+            <div className="empty-state"><Database size={28} /><strong>No captures</strong><span>Waiting for completed network records</span></div>
+          ) : interactions.map((interaction) => (
+            <button
+              key={interaction.id}
+              className={`interaction-row ${selectedInteraction === interaction.id ? 'selected' : ''}`}
+              onClick={() => setSelectedInteraction(interaction.id)}
+            >
+              <span className={`protocol protocol-${interaction.protocol}`}>{interaction.protocol}</span>
+              <strong>{safeUrl(interaction.url)}</strong>
+              <small>{interaction.captureCount} records · {formatTime(interaction.capturedAt)}</small>
+            </button>
+          ))}
+        </aside>
+
+        <section className="capture-pane">
+          <nav className="capture-strip">
+            {summaries.map((summary) => (
+              <button
+                key={summary.id}
+                className={selectedCapture?.id === summary.id ? 'selected' : ''}
+                onClick={() => void selectCapture(summary.id)}
+              >
+                <KindIcon capture={summary} />
+                <span>{kindLabel(summary.kind)}</span>
+                {summary.byteLength !== null && <small>{formatBytes(summary.byteLength)}</small>}
+              </button>
+            ))}
+          </nav>
+
+          {!selectedCapture ? <div className="empty-detail">Select a capture record</div> : (
+            <div className="detail">
+              <div className="detail-heading">
+                <div><span className="kind-chip">{selectedCapture.kind}</span><h2>{safeUrl(selectedCapture.url)}</h2></div>
+                <time>{new Date(selectedCapture.capturedAt).toLocaleString()}</time>
+              </div>
+              {isLossy(selectedCapture) && (
+                <div className="warning"><AlertTriangle size={14} />This record contains browser API projections; unavailable fields are not reconstructed.</div>
+              )}
+              <div className="tabs">
+                {(['overview', 'headers', 'body'] as const).map((tab) => (
+                  <button key={tab} className={detailTab === tab ? 'active' : ''} onClick={() => setDetailTab(tab)}>{tab}</button>
+                ))}
+              </div>
+              {detailTab === 'overview' && <Overview capture={selectedCapture} />}
+              {detailTab === 'headers' && <HeadersView headers={headersOf(selectedCapture)} />}
+              {detailTab === 'body' && (
+                <BodyPanel capture={selectedCapture} body={bodyOf(selectedCapture)} view={bodyView} setView={setBodyView} />
+              )}
+            </div>
+          )}
+        </section>
+      </div>
     </main>
   );
+}
+
+function CapacityBadge({ status }: { status: CapacityStatus }) {
+  return <div className={`capacity capacity-${status.level}`}><Database size={13} />{formatBytes(status.logicalBytes)} / {formatBytes(status.hardLimitBytes)}</div>;
+}
+
+function KindIcon({ capture }: { capture: CaptureSummary }) {
+  if (capture.kind === 'websocket-message') return capture.direction === 'outbound' ? <ArrowUpRight size={13} /> : <ArrowDownLeft size={13} />;
+  if (capture.kind === 'http-request') return <ArrowUpRight size={13} />;
+  return <span className="event-dot" />;
+}
+
+function Overview({ capture }: { capture: Capture }) {
+  const rows: Array<[string, string]> = [
+    ['URL', capture.url], ['Page', capture.pageUrl], ['Rule', capture.matchedRuleId],
+    ['Config revision', capture.configRevision], ['Capture ID', capture.id],
+  ];
+  if ('exchangeId' in capture && capture.exchangeId) rows.push(['Exchange ID', capture.exchangeId]);
+  if ('streamId' in capture) rows.push(['Stream ID', capture.streamId], ['Fidelity', capture.fidelity]);
+  if ('connectionId' in capture) rows.push(['Connection ID', capture.connectionId]);
+  if (capture.kind === 'http-request') rows.push(['Method', capture.method]);
+  if (capture.kind === 'http-response') rows.push(['Status', `${capture.status} ${capture.statusText}`]);
+  if ('transport' in capture) rows.push(['Transport', capture.transport], ['HTTP version', `${capture.httpVersion.value} (${capture.httpVersion.source})`]);
+  if ('attempt' in capture) rows.push(['Attempt', String(capture.attempt)]);
+  if (capture.kind === 'sse-stream-open') rows.push(['Status', observationText(capture.status)], ['HTTP version', `${capture.httpVersion.value} (${capture.httpVersion.source})`]);
+  if (capture.kind === 'websocket-message') rows.push(['Direction', capture.direction], ['Sequence', String(capture.sequence)]);
+  if (capture.kind === 'sse-event') rows.push(['Sequence', String(capture.sequence)], ['Event type', capture.eventType ?? 'unavailable']);
+  if (capture.kind === 'sse-stream-close') rows.push(['Outcome', capture.outcome], ['Events', String(capture.eventCount)], ['Captured bytes', String(capture.capturedByteLength)]);
+  if (capture.kind === 'websocket-open') rows.push(['Requested protocols', capture.requestedProtocols.join(', ') || 'none'], ['Negotiated protocol', capture.negotiatedProtocol || 'none'], ['Extensions', capture.extensions || 'none'], ['Handshake', `unavailable: ${capture.handshake.reason}`]);
+  if (capture.kind === 'websocket-close') rows.push(['Close', `${capture.code} · ${capture.wasClean ? 'clean' : 'unclean'}`], ['Messages sent', String(capture.sentMessageCount)], ['Messages received', String(capture.receivedMessageCount)]);
+  if (capture.kind.endsWith('error')) rows.push(['Error', 'reason' in capture ? String(capture.reason ?? 'unknown') : 'unknown']);
+  return <dl className="metadata">{rows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>;
+}
+
+function HeadersView({ headers }: { headers: MessageHeaders | null }) {
+  if (!headers) return <div className="state-box">Headers do not apply to this record.</div>;
+  if (headers.state === 'unavailable') return <div className="state-box warning">Unavailable: {headers.reason}</div>;
+  if (headers.entries.length === 0) return <div className="state-box">No script-visible headers.</div>;
+  return <div className="headers-view"><button className="icon-button copy-button" title="Copy headers" onClick={() => void copyText(headers.entries.map(([name, value]) => `${name}: ${value}`).join('\n'))}><Copy size={14} /></button><div className="headers-table">{headers.entries.map(([name, value], index) => <div key={`${name}-${index}`}><code>{name}</code><span>{value}</span></div>)}</div></div>;
+}
+
+function BodyPanel({ capture, body, view, setView }: { capture: Capture; body: MessageBody | null; view: BodyView; setView(value: BodyView): void }) {
+  if (!body) return <div className="state-box">Body does not apply to this record.</div>;
+  if (body.state === 'absent') return <div className="state-box">Body absent.</div>;
+  if (body.state === 'unavailable') return <div className="state-box warning">Unavailable: {body.reason}{body.partialByteLength ? ` · ${formatBytes(body.partialByteLength)} observed` : ''}</div>;
+  const bytes = base64ToBytes(body.data);
+  const rendered = view === 'base64' ? body.data : view === 'text' ? decodeText(capture, bytes) : toHex(bytes);
+  return <div className="body-panel">
+    <div className="body-toolbar"><span>{formatBytes(body.byteLength)}{body.fidelity === 'decoded-text-projection' ? ' · decoded text projection' : ''}</span><div>{(['hex', 'base64', 'text'] as const).map((item) => <button key={item} className={view === item ? 'active' : ''} onClick={() => setView(item)}>{item}</button>)}<button className="icon-button" title="Copy body" onClick={() => void copyText(rendered)}><Copy size={14} /></button></div></div>
+    <pre>{rendered}</pre>
+  </div>;
+}
+
+function headersOf(capture: Capture): MessageHeaders | null {
+  return 'headers' in capture ? capture.headers : null;
+}
+
+function bodyOf(capture: Capture): MessageBody | null {
+  return 'body' in capture ? capture.body : null;
+}
+
+function isLossy(capture: Capture): boolean {
+  return ('fidelity' in capture && capture.fidelity !== 'raw-event-bytes') ||
+    capture.kind.startsWith('websocket-');
+}
+
+function safeUrl(value: string): string {
+  try { const url = new URL(value); return `${url.host}${url.pathname}`; } catch { return value; }
+}
+
+function kindLabel(kind: Capture['kind']): string {
+  return kind.replace('websocket-', 'ws ').replace('sse-stream-', 'stream ').replace('sse-', '').replace('http-', '');
+}
+
+function formatTime(value: number): string { return new Date(value).toLocaleTimeString(); }
+function formatBytes(value: number): string { return value < 1024 ? `${value} B` : value < 1024 ** 2 ? `${(value / 1024).toFixed(1)} KiB` : `${(value / 1024 ** 2).toFixed(1)} MiB`; }
+function toHex(bytes: Uint8Array): string { return Array.from(bytes, (byte, index) => `${index % 16 === 0 ? `${index.toString(16).padStart(8, '0')}  ` : ''}${byte.toString(16).padStart(2, '0')}${index % 16 === 15 ? '\n' : ' '}`).join(''); }
+
+function observationText(value: { state: 'observed'; value: number } | { state: 'unavailable'; reason: string }): string {
+  return value.state === 'observed' ? String(value.value) : `unavailable: ${value.reason}`;
+}
+
+function decodeText(capture: Capture, bytes: Uint8Array): string {
+  const headers = headersOf(capture);
+  const contentType = headers?.state === 'captured' ? headers.entries.find(([name]) => name.toLowerCase() === 'content-type')?.[1] : undefined;
+  return decodeBodyText(bytes, contentType) ?? toHex(bytes);
+}
+
+async function copyText(value: string): Promise<void> {
+  await navigator.clipboard.writeText(value);
 }

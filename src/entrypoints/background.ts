@@ -1,144 +1,171 @@
-import { FilterConfig, HookEvent, Session } from '../types';
-import { saveSession, getSession, getFilterConfig, saveFilterConfig, resetFilterConfig } from '../utils/storage';
+import { CAPTURE_PORT_NAME, type ConfigEnvelope } from '../channel/config-channel';
+import { parseCaptureFrame } from '../capture/capture-frame';
+import { BundledConfigSource } from '../config/bundled-config-source';
+import { createConfigManager } from '../config/config-manager';
+import { saveDebugUiConfig } from '../config/config-projection-store';
+import { ChromeLocalConsentSource, LOCAL_CONSENT_STORAGE_KEY } from '../config/local-consent';
+import { DEFAULT_SAFETY_POLICY } from '../config/safety-policy';
+import { createDelivery } from '../delivery/delivery';
+import { createHttpDeliveryTransport } from '../delivery/http-delivery';
+import { createCaptureStore } from '../storage/capture-store';
+import { appendDiagnostic, type DiagnosticArea, type DiagnosticLevel } from '../storage/diagnostic-store';
 
 export default defineBackground(() => {
-  // Keep in-flight sessions until their final event arrives.
-  const activeSessions = new Map<string, Session>();
+  let initialization: Promise<void> | null = null;
+  const ports = new Set<chrome.runtime.Port>();
+  const ackTimers = new Map<chrome.runtime.Port, ReturnType<typeof setTimeout>>();
+  const manager = createConfigManager({
+    sources: [new BundledConfigSource()],
+    consent: new ChromeLocalConsentSource(),
+    safetyPolicy: DEFAULT_SAFETY_POLICY,
+  });
+  const store = createCaptureStore({
+    config: () => manager.projections()?.storage ?? {
+      revision: 'bootstrap', warningBytes: 384 * 1024 * 1024,
+      hardLimitBytes: 512 * 1024 * 1024, draftTtlMs: 86_400_000,
+    },
+    onDiagnostic: (code, message) => { void reportDiagnostic('storage', 'warn', code, message); },
+  });
+  const delivery = createDelivery({
+    queue: store,
+    config: () => manager.projections()?.delivery ?? {
+      revision: 'bootstrap', enabled: false, endpoint: null,
+      batchSize: 50, flushIntervalMs: 60_000, timeoutMs: 15_000,
+    },
+    transport: createHttpDeliveryTransport,
+  });
 
-  // Open side panel on action button click
-  chrome.sidePanel?.setPanelBehavior?.({ openPanelOnActionClick: true }).catch(() => {});
+  const envelope = (): ConfigEnvelope | null => {
+    const projections = manager.projections();
+    if (!projections) return null;
+    return { kind: 'config', revision: projections.main.revision, main: projections.main, isolated: projections.isolated };
+  };
 
-  async function broadcastConfig(config: FilterConfig) {
-    chrome.runtime.sendMessage({ type: 'AI_HOOK_CONFIG_SYNC', data: config }).catch(() => {});
-    chrome.tabs?.query?.({}, (tabs) => {
-      for (const tab of tabs) {
-        if (tab.id) {
-          chrome.tabs.sendMessage(tab.id, { type: 'AI_HOOK_CONFIG_SYNC', data: config }).catch(() => {});
-        }
-      }
+  manager.subscribe(() => { void applyActiveConfig(); });
+  void initialize();
+  void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+
+  function initialize(): Promise<void> {
+    initialization ??= (async () => {
+      await manager.initialize();
+      await store.cleanup();
+      scheduleConfigRefresh();
+    })().catch((error) => {
+      initialization = null;
+      console.error('[Background] initialization failed', error);
+      throw error;
     });
+    return initialization;
   }
 
-  async function handleHookEvent(payload: HookEvent) {
-    if (!payload || !payload.id) return;
-
-    if (payload.type === 'AI_HOOK_START') {
-      const newSession: Session = {
-        id: payload.id,
-        platform: payload.platform || 'generic-raw',
-        model: payload.model,
-        url: payload.url || '',
-        timestamp: payload.timestamp || Date.now(),
-        status: 'streaming',
-        prompts: payload.prompts || [],
-        response: '',
-        rawRequest: payload.rawRequest,
-        method: payload.method,
-        requestBody: payload.rawRequest,
-        requestContentType: payload.contentType,
-        transport: payload.transport,
-        format: payload.format
-      };
-      activeSessions.set(payload.id, newSession);
-      await saveSession(newSession);
-      broadcastUpdate(payload);
-    } else if (payload.type === 'AI_HOOK_CHUNK') {
-      const session = activeSessions.get(payload.id);
-      if (session) {
-        session.response = payload.response || session.response + (payload.delta || '');
-        if (payload.model) session.model = payload.model;
-        if (payload.contentType) session.responseContentType = payload.contentType;
-        if (payload.statusCode) session.statusCode = payload.statusCode;
-        if (payload.transport) session.transport = payload.transport;
-        if (payload.format) session.format = payload.format;
-        // Broadcast chunk to UI without saving to DB every chunk to optimize performance
-        broadcastUpdate(payload);
-      }
-    } else if (payload.type === 'AI_HOOK_END') {
-      let session = activeSessions.get(payload.id);
-      if (!session) {
-        session = await getSession(payload.id);
-      }
-
-      if (session) {
-        session.status = payload.status || 'completed';
-        session.response = payload.response || session.response;
-        if (payload.model) session.model = payload.model;
-        if (payload.contentType) session.responseContentType = payload.contentType;
-        if (payload.statusCode) session.statusCode = payload.statusCode;
-        if (payload.transport) session.transport = payload.transport;
-        if (payload.format) session.format = payload.format;
-        session.durationMs = Date.now() - session.timestamp;
-
-        await saveSession(session);
-        activeSessions.delete(payload.id);
-        broadcastUpdate(payload);
-
-      }
-    } else if (payload.type === 'AI_HOOK_ERROR') {
-      const session = activeSessions.get(payload.id);
-      if (session) {
-        session.status = 'error';
-        session.error = payload.error;
-        session.durationMs = Date.now() - session.timestamp;
-        await saveSession(session);
-        activeSessions.delete(payload.id);
-        broadcastUpdate(payload);
-      }
-    }
+  async function applyActiveConfig() {
+    const debugUi = manager.projection('debugUi');
+    if (debugUi) await saveDebugUiConfig(debugUi);
+    scheduleDelivery();
+    for (const port of ports) sendConfig(port);
   }
 
-  function broadcastUpdate(payload: HookEvent) {
-    chrome.runtime.sendMessage({ type: 'AI_HOOK_BROADCAST', data: payload }).catch(() => {
-      // SidePanel / popup might not be open, safe to ignore
-    });
-  }
-
-  // Handle Port connections from content script
   chrome.runtime.onConnect.addListener((port) => {
-    if (port.name === 'AI_HOOK_PORT') {
-      port.onMessage.addListener((msg: HookEvent) => {
-        handleHookEvent(msg);
-      });
+    if (port.name !== CAPTURE_PORT_NAME) return;
+    ports.add(port);
+    port.onMessage.addListener((message: unknown) => {
+      if (isObject(message) && message.kind === 'config-request') {
+        sendConfig(port);
+        return;
+      }
+      if (isObject(message) && message.kind === 'config-ack' && typeof message.revision === 'string') {
+        const value = envelope();
+        if (value?.revision === message.revision) clearAckTimer(port);
+        return;
+      }
+      if (isDiagnosticMessage(message)) {
+        void reportDiagnostic(message.area, message.level, message.code, message.message, message.occurredAt);
+        return;
+      }
+      if (!isObject(message) || message.kind !== 'capture-frame') return;
+      const maxBytes = manager.projections()?.isolated.maxFrameBytes ?? 64 * 1024;
+      const frame = parseCaptureFrame(message.frame, maxBytes);
+      if (frame) void store.ingest(frame)
+        .then(() => store.cleanup())
+        .catch((error) => { void reportDiagnostic('storage', 'warn', 'frame-rejected', errorMessage(error)); });
+    });
+    port.onDisconnect.addListener(() => {
+      ports.delete(port);
+      clearAckTimer(port);
+    });
+    void initialize().then(() => sendConfig(port));
+  });
+
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === 'capture-delivery') void delivery.flush().then((result) => {
+      if (result.status === 'failed') void reportDiagnostic('delivery', 'warn', 'flush-failed', errorMessage(result.error));
+    });
+    if (alarm.name === 'capture-config-refresh') void manager.reload().catch((error) => { void reportDiagnostic('config', 'warn', 'refresh-failed', errorMessage(error)); });
+  });
+
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName === 'local' && LOCAL_CONSENT_STORAGE_KEY in changes) {
+      void manager.reload().catch((error) => { void reportDiagnostic('config', 'warn', 'consent-refresh-failed', errorMessage(error)); });
     }
   });
 
-  // Handle one-off messages (Hook events & Config management)
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (!message) return;
-
-    if (message.type === 'GET_FILTER_CONFIG') {
-      getFilterConfig().then((config) => {
-        sendResponse({ config });
-      });
-      return true;
+  function sendConfig(port: chrome.runtime.Port) {
+    const value = envelope();
+    if (!value) return;
+    try {
+      port.postMessage(value);
+      clearAckTimer(port);
+      ackTimers.set(port, setTimeout(() => {
+        ackTimers.delete(port);
+        if (ports.has(port)) sendConfig(port);
+      }, 1_000));
+    } catch (error) {
+      console.warn('[Channel] config publish failed', error);
     }
+  }
 
-    if (message.type === 'UPDATE_FILTER_CONFIG') {
-      const newConfig = message.data as FilterConfig;
-      saveFilterConfig(newConfig).then(async () => {
-        await broadcastConfig(newConfig);
-        sendResponse({ status: 'ok', config: newConfig });
-      });
-      return true;
+  function clearAckTimer(port: chrome.runtime.Port) {
+    const timer = ackTimers.get(port);
+    if (timer) clearTimeout(timer);
+    ackTimers.delete(port);
+  }
+
+  function scheduleDelivery() {
+    const config = manager.projections()?.delivery;
+    if (!config?.enabled) {
+      void chrome.alarms.clear('capture-delivery');
+      return;
     }
+    chrome.alarms.create('capture-delivery', { periodInMinutes: Math.max(config.flushIntervalMs / 60_000, 0.5) });
+  }
 
-    if (message.type === 'RESET_FILTER_CONFIG') {
-      resetFilterConfig().then(async (config) => {
-        await broadcastConfig(config);
-        sendResponse({ status: 'ok', config });
-      });
-      return true;
-    }
+  function scheduleConfigRefresh() {
+    chrome.alarms.create('capture-config-refresh', { periodInMinutes: 60 });
+  }
 
-    if (message?.type && message.type.startsWith('AI_HOOK_')) {
-      handleHookEvent(message);
-      sendResponse({ status: 'ok' });
-      return true;
-    }
-
-    return true;
-  });
-
-  console.log('[AI Chatbox Hook] Background Service Worker ready.');
+  async function reportDiagnostic(area: DiagnosticArea, level: DiagnosticLevel, code: string, message: string, occurredAt = Date.now()) {
+    const config = manager.projection('observability');
+    if (!config) return;
+    if (levelEnabled(level, config.logLevel)) console[level](`[${area}] ${code}: ${message}`);
+    await appendDiagnostic({ id: crypto.randomUUID(), occurredAt, area, level, code, message }, config.retainDiagnostics);
+  }
 });
+
+function isObject(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isDiagnosticMessage(value: unknown): value is { area: DiagnosticArea; level: DiagnosticLevel; code: string; message: string; occurredAt: number } {
+  if (!isObject(value) || value.kind !== 'diagnostic') return false;
+  return value.area === 'channel' && value.level === 'warn' && typeof value.code === 'string' &&
+    typeof value.message === 'string' && typeof value.occurredAt === 'number';
+}
+
+function levelEnabled(level: DiagnosticLevel, configured: DiagnosticLevel): boolean {
+  const rank: Record<DiagnosticLevel, number> = { error: 0, warn: 1, info: 2, debug: 3 };
+  return rank[level] <= rank[configured];
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

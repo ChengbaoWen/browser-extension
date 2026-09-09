@@ -1,0 +1,149 @@
+{
+    "schemaVersion": 1,
+    "revision": "2026-09-09.5",
+    "issuedAt": 1788940800000,
+    "expiresAt": null,
+    "capture": {
+        "enabled": true,
+        "endpoints": [
+            {
+                "id": "openai-api",
+                "hosts": [
+                    {
+                        "schemes": [
+                            "https"
+                        ],
+                        "host": "api.openai.com",
+                        "paths": [
+                            {
+                                "match": "exact",
+                                "value": "/v1/chat/completions"
+                            },
+                            {
+                                "match": "exact",
+                                "value": "/v1/responses"
+                            }
+                        ]
+                    }
+                ]
+            },
+            {
+                "id": "deepseek-web-chat",
+                "hosts": [
+                    {
+                        "schemes": [
+                            "https"
+                        ],
+                        "host": "chat.deepseek.com",
+                        "paths": [
+                            {
+                                "match": "exact",
+                                "value": "/api/v0/chat/completion"
+                            }
+                        ]
+                    }
+                ]
+            },
+            {
+                "id": "chatgpt-web-conversation",
+                "hosts": [
+                    {
+                        "schemes": [
+                            "https"
+                        ],
+                        "host": "chatgpt.com",
+                        "paths": [
+                            {
+                                "match": "exact",
+                                "value": "/backend-api/f/conversation"
+                            }
+                        ]
+                    }
+                ]
+            },
+            {
+                "id": "dola-web-chat",
+                "hosts": [
+                    {
+                        "schemes": [
+                            "https"
+                        ],
+                        "host": "www.dola.com",
+                        "paths": [
+                            {
+                                "match": "exact",
+                                "value": "/chat/completion"
+                            }
+                        ]
+                    }
+                ]
+            },
+            {
+                "id": "gemini-web-chat",
+                "hosts": [
+                    {
+                        "schemes": [
+                            "https"
+                        ],
+                        "host": "gemini.google.com",
+                        "paths": [
+                            {
+                                "match": "exact",
+                                "value": "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
+                            }
+                        ]
+                    }
+                ]
+            }
+        ],
+        "http": {
+            "enabled": true,
+            "captureRequestBody": true,
+            "captureResponseBody": true,
+            "maxBodyBytes": 16777216
+        },
+        "sse": {
+            "enabled": true,
+            "sources": [
+                "fetch",
+                "xhr",
+                "event-source"
+            ],
+            "maxEventBytes": 1048576,
+            "maxStreamBytes": 67108864
+        },
+        "websocket": {
+            "enabled": true,
+            "maxMessageBytes": 4194304,
+            "maxConnectionBytes": 67108864
+        }
+    },
+    "channel": {
+        "maxFrameBytes": 65536,
+        "maxQueuedFrames": 512,
+        "maxQueuedBytes": 8388608,
+        "reconnectInitialDelayMs": 250,
+        "reconnectMaxDelayMs": 10000
+    },
+    "storage": {
+        "warningBytes": 402653184,
+        "hardLimitBytes": 536870912,
+        "draftTtlMs": 86400000
+    },
+    "delivery": {
+        "enabled": false,
+        "endpoint": null,
+        "batchSize": 50,
+        "flushIntervalMs": 60000,
+        "timeoutMs": 15000
+    },
+    "debugUi": {
+        "refreshIntervalMs": 2000,
+        "pageSize": 100,
+        "defaultBodyView": "text"
+    },
+    "observability": {
+        "logLevel": "warn",
+        "retainDiagnostics": 200
+    }
+}
