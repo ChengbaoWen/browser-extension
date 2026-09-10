@@ -1,12 +1,15 @@
-import { parseSystemConfig } from './config-contract';
-import { createConfigProjections, type ConfigProjectionMap } from './config-projections';
-import type { ConfigSource } from './config-source';
-import type { LocalConsentSource } from './local-consent';
-import type { SafetyPolicy, SystemConfig } from './system-config';
+import { parseSystemConfig } from "./config-contract";
+import {
+    createConfigProjections,
+    type ConfigProjectionMap,
+} from "./config-projections";
+import type { ConfigSource } from "./config-source";
+import type { LocalConsentSource } from "./local-consent";
+import type { SafetyPolicy, SystemConfig } from "./system-config";
 
 export interface ConfigRefreshResult {
-  status: 'activated' | 'unchanged' | 'retained-current' | 'safe-disabled';
-  source: ConfigSource['name'] | 'safe-default';
+  status: "activated" | "unchanged" | "retained-current" | "safe-disabled";
+  source: ConfigSource["name"] | "safe-default";
   revision: string;
 }
 
@@ -14,7 +17,9 @@ export interface ConfigManager {
   initialize(): Promise<SystemConfig | null>;
   reload(): Promise<ConfigRefreshResult>;
   current(): SystemConfig | null;
-  projection<T extends keyof ConfigProjectionMap>(name: T): ConfigProjectionMap[T] | null;
+  projection<T extends keyof ConfigProjectionMap>(
+    name: T,
+  ): ConfigProjectionMap[T] | null;
   projections(): ConfigProjectionMap | null;
   subscribe(listener: (config: SystemConfig | null) => void): () => void;
 }
@@ -30,16 +35,26 @@ export function createConfigManager(options: {
   let projections: ConfigProjectionMap | null = null;
   const listeners = new Set<(config: SystemConfig | null) => void>();
 
-  async function choose(): Promise<{ config: SystemConfig; source: ConfigSource['name'] | 'safe-default' }> {
+  async function choose(): Promise<{
+    config: SystemConfig;
+    source: ConfigSource["name"] | "safe-default";
+  }> {
     for (const source of options.sources) {
       try {
-        const candidate = parseSystemConfig(await source.load(), options.safetyPolicy, now());
+        const candidate = parseSystemConfig(
+          await source.load(),
+          options.safetyPolicy,
+          now(),
+        );
         return { config: candidate, source: source.name };
       } catch (error) {
         console.warn(`[Config] ${source.name} config rejected`, error);
       }
     }
-    return { config: createSafeConfig(options.safetyPolicy, now()), source: 'safe-default' };
+    return {
+      config: createSafeConfig(options.safetyPolicy, now()),
+      source: "safe-default",
+    };
   }
 
   async function activate(config: SystemConfig): Promise<void> {
@@ -51,7 +66,7 @@ export function createConfigManager(options: {
       try {
         listener(config);
       } catch (error) {
-        console.warn('[Config] subscriber failed', error);
+        console.warn("[Config] subscriber failed", error);
       }
     }
   }
@@ -64,29 +79,55 @@ export function createConfigManager(options: {
     },
     async reload() {
       const current = active;
-      if (current && (current.expiresAt === null || current.expiresAt > now())) {
+      if (
+        current &&
+        (current.expiresAt === null || current.expiresAt > now())
+      ) {
         const firstSource = options.sources[0];
         if (firstSource) {
           try {
-            const candidate = parseSystemConfig(await firstSource.load(), options.safetyPolicy, now());
+            const candidate = parseSystemConfig(
+              await firstSource.load(),
+              options.safetyPolicy,
+              now(),
+            );
             if (candidate.revision === current.revision) {
               await activate(candidate);
-              return { status: 'unchanged', source: firstSource.name, revision: current.revision };
+              return {
+                status: "unchanged",
+                source: firstSource.name,
+                revision: current.revision,
+              };
             }
             await activate(candidate);
-            return { status: 'activated', source: firstSource.name, revision: candidate.revision };
+            return {
+              status: "activated",
+              source: firstSource.name,
+              revision: candidate.revision,
+            };
           } catch {
-            return { status: 'retained-current', source: firstSource.name, revision: current.revision };
+            await activate(current);
+            return {
+              status: "retained-current",
+              source: firstSource.name,
+              revision: current.revision,
+            };
           }
         }
       }
       const selected = await choose();
       if (active?.revision === selected.config.revision) {
-        return { status: 'unchanged', source: selected.source, revision: selected.config.revision };
+        await activate(selected.config);
+        return {
+          status: "unchanged",
+          source: selected.source,
+          revision: selected.config.revision,
+        };
       }
       await activate(selected.config);
       return {
-        status: selected.source === 'safe-default' ? 'safe-disabled' : 'activated',
+        status:
+          selected.source === "safe-default" ? "safe-disabled" : "activated",
         source: selected.source,
         revision: selected.config.revision,
       };
@@ -101,7 +142,10 @@ export function createConfigManager(options: {
   };
 }
 
-function createSafeConfig(safety: SafetyPolicy, issuedAt: number): SystemConfig {
+function createSafeConfig(
+  safety: SafetyPolicy,
+  issuedAt: number,
+): SystemConfig {
   return {
     schemaVersion: 1,
     revision: `safe-disabled-${issuedAt}`,
@@ -110,7 +154,12 @@ function createSafeConfig(safety: SafetyPolicy, issuedAt: number): SystemConfig 
     capture: {
       enabled: false,
       endpoints: [],
-      http: { enabled: false, captureRequestBody: false, captureResponseBody: false, maxBodyBytes: 0 },
+      http: {
+        enabled: false,
+        captureRequestBody: false,
+        captureResponseBody: false,
+        maxBodyBytes: 0,
+      },
       sse: { enabled: false, sources: [], maxEventBytes: 0, maxStreamBytes: 0 },
       websocket: { enabled: false, maxMessageBytes: 0, maxConnectionBytes: 0 },
     },
@@ -126,8 +175,18 @@ function createSafeConfig(safety: SafetyPolicy, issuedAt: number): SystemConfig 
       hardLimitBytes: safety.storageHardLimitBytes,
       draftTtlMs: 86_400_000,
     },
-    delivery: { enabled: false, endpoint: null, batchSize: 50, flushIntervalMs: 60_000, timeoutMs: 15_000 },
-    debugUi: { refreshIntervalMs: 2_000, pageSize: 100, defaultBodyView: 'text' },
-    observability: { logLevel: 'warn', retainDiagnostics: 200 },
+    delivery: {
+      enabled: false,
+      endpoint: null,
+      batchSize: 50,
+      flushIntervalMs: 60_000,
+      timeoutMs: 15_000,
+    },
+    debugUi: {
+      refreshIntervalMs: 2_000,
+      pageSize: 100,
+      defaultBodyView: "text",
+    },
+    observability: { logLevel: "warn", retainDiagnostics: 200 },
   };
 }

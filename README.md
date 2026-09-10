@@ -14,16 +14,16 @@
 
 ## 技术栈
 
-| 类别 | 选型 | 用途 |
-| :--- | :--- | :--- |
-| 浏览器平台 | Chrome Manifest V3 | 扩展运行环境 |
-| 扩展框架 | WXT | 入口、Manifest 与构建管理 |
-| 开发语言 | TypeScript 严格模式 | 类型安全的扩展逻辑 |
-| 网络 API | Fetch、XMLHttpRequest、Web Streams | 请求捕获与响应流复制 |
-| 配置 | SystemConfig、ConfigSource | 所有模块配置、当前 bundled snapshot 及未来 HTTP 来源 |
-| 持久化 | IndexedDB | 本地原文存储及 delivery pending 队列 |
-| 测试 | Vitest | URL 匹配、SSE 分帧与采集粒度测试 |
-| 检查界面 | React、Side Panel | 开发与生产构建查看采集结果 |
+| 类别       | 选型                               | 用途                                                 |
+| :--------- | :--------------------------------- | :--------------------------------------------------- |
+| 浏览器平台 | Chrome Manifest V3                 | 扩展运行环境                                         |
+| 扩展框架   | WXT                                | 入口、Manifest 与构建管理                            |
+| 开发语言   | TypeScript 严格模式                | 类型安全的扩展逻辑                                   |
+| 网络 API   | Fetch、XMLHttpRequest、Web Streams | 请求捕获与响应流复制                                 |
+| 配置       | SystemConfig、ConfigSource         | 所有模块配置、当前 bundled snapshot 及未来 HTTP 来源 |
+| 持久化     | IndexedDB                          | 本地原文存储及 delivery pending 队列                 |
+| 测试       | Vitest                             | URL 匹配、SSE 分帧与采集粒度测试                     |
+| 检查界面   | React、Side Panel                  | 开发与生产构建查看采集结果                           |
 
 ## 采集范围
 
@@ -72,6 +72,16 @@ Fetch/XHR 根据响应头中的 `Content-Type: text/event-stream` 判断 SSE，�
 Capture 保存在客户端 IndexedDB，并通过只读 Side Panel 提供查看入口；拥有浏览器 DevTools 或本机文件访问权限的人也可能直接读取数据，因此不能对设备所有者隐藏本地明文。
 
 ## 开发命令
+
+开发前请先安装 Node.js，并在 `browser-extension` 目录按锁文件安装依赖：
+
+```bash
+npm ci
+```
+
+首次检出项目、删除 `node_modules` 或切换到依赖有变化的分支后，需要重新执行 `npm ci`。只有在主动添加或升级依赖、需要更新 `package-lock.json` 时才使用 `npm install`。
+
+依赖安装完成后，可以运行以下命令：
 
 ```bash
 npm run dev
